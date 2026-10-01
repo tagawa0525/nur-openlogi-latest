@@ -1,0 +1,90 @@
+name: Update OpenLogi
+
+on:
+  schedule:
+    - cron: "0 21 * * *" # daily 06:00 JST
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-openlogi
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: AprilNEA/OpenLogi
+  SOURCES: pkgs/openlogi/sources.json
+  # Release signing key, pinned here rather than read from upstream at run time
+  # so a compromised release cannot also swap the key it is checked against.
+  # Same value as MINISIGN_PUBLIC_KEY in upstream packaging/linux/install.sh.
+  MINISIGN_PUBLIC_KEY: RWRRkFtw+rqkvTlCTGKUszSE5dX9CK1teaQD45jO4P9rYlWLO4/nHVUF
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compare with the latest release
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          current=$(jq -r .version "$SOURCES")
+          tag=$(gh release view --repo "$UPSTREAM" --json tagName --jq .tagName)
+          latest=${tag#v}
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          if [ "$current" = "$latest" ]; then
+            echo "::notice::OpenLogi $current is up-to-date"
+          else
+            echo "::notice::Updating OpenLogi $current -> $latest"
+          fi
+
+      - name: Download and verify the release package
+        if: steps.latest.outputs.current != steps.latest.outputs.latest
+        id: verify
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.latest.outputs.latest }}
+        run: |
+          asset="openlogi-v${VERSION}-linux-amd64.pkg.tar.zst"
+          gh release download "v${VERSION}" --repo "$UPSTREAM" \
+            --pattern "$asset" --pattern "$asset.minisig" --dir "$RUNNER_TEMP"
+          nix run nixpkgs#minisign -- -V -P "$MINISIGN_PUBLIC_KEY" \
+            -m "$RUNNER_TEMP/$asset" -x "$RUNNER_TEMP/$asset.minisig"
+          echo "hash=$(nix hash file --sri --type sha256 "$RUNNER_TEMP/$asset")" >> "$GITHUB_OUTPUT"
+
+      - name: Update sources.json
+        if: steps.latest.outputs.current != steps.latest.outputs.latest
+        env:
+          VERSION: ${{ steps.latest.outputs.latest }}
+          HASH: ${{ steps.verify.outputs.hash }}
+        run: |
+          jq --arg version "$VERSION" --arg hash "$HASH" \
+            '.version = $version | .hash = $hash' "$SOURCES" > "$SOURCES.tmp"
+          mv "$SOURCES.tmp" "$SOURCES"
+
+      - name: Build package (test)
+        if: steps.latest.outputs.current != steps.latest.outputs.latest
+        # Includes the install check (openlogi --version must report the new
+        # version), so a changed package layout fails here instead of on hosts
+        run: nix build .#openlogi --no-link --print-build-logs
+
+      - name: Commit and push
+        if: steps.latest.outputs.current != steps.latest.outputs.latest
+        env:
+          CURRENT: ${{ steps.latest.outputs.current }}
+          LATEST: ${{ steps.latest.outputs.latest }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$SOURCES"
+          git commit -m "chore: update OpenLogi $CURRENT -> $LATEST"
+          git push
